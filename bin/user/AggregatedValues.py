@@ -17,7 +17,7 @@ import weecfg
 import weeutil
 import weewx
 
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from weeutil.weeutil import to_bool, to_float, to_int, TimeSpan
 from weewx.engine import StdService
 
@@ -50,14 +50,19 @@ def resolve_obs_group(observation, agg_type):
     # Fall back to the observation's own group
     return weewx.units.obs_group_dict.get(observation)
 
-def effective_date(dt, since_hour):
+def period_day(timestamp, since_hour=0):
+    """
+    Return the date of the day an archive record belongs to. A record stamped exactly on the
+    boundary belongs to the day that's ending, the same as weeutil's archive spans.
 
-    cutoff = time(since_hour)
-
-    if dt.time() >= cutoff:
-        return dt
-    else:
-        return dt - timedelta(days=1)
+    - since_hour 0: days run midnight to midnight and are dated by the day they start on.
+    - since_hour set: days run since_hour to since_hour and are dated by the day they end on,
+      the same as BoM rainfall, eg rain from 9am on the 24th to 9am on the 25th is the 25th.
+    """
+    dt = datetime.fromtimestamp(timestamp - 1)
+    if since_hour and dt.time() >= time(since_hour):
+        return dt.date() + timedelta(days=1)
+    return dt.date()
 
 # log = logging.getLogger(__name__)
 def setup_logging(logging_level, config_dict):
@@ -88,9 +93,9 @@ class StrorageClassV2():
 
     def __init__(self):
 
-        self.since_hour = 0
-        self.dt = datetime.now()
-        self.eff_dt = effective_date(self.dt, self.since_hour)
+        # The days the cached values were generated for, see period_day
+        self.day = None
+        self.since_day = None
         self.yesterday = None
         self.month = None
         self.last_month = None
@@ -126,7 +131,7 @@ class TimeSpanProvider:
         if not 0 <= since_hour <= 23:
             raise ValueError("since_hour must be between 0 and 23 or not set")
 
-        self.since_seconds = since_hour * 3600
+        self.since_hour = since_hour
 
         self.first_timestamp = first_timestamp
 
@@ -204,69 +209,52 @@ class TimeSpanProvider:
         """ Get a TimeSpan for the last N days """
         return TimeSpan(timestamp - days * 86400, timestamp)
 
-    def shift_timespan(self, current_timespan):
-        """ Shift the start/stop time by since_seconds """
-        return TimeSpan(current_timespan.start + self.since_seconds, current_timespan.stop + self.since_seconds)
-
-    def check_timespan(self, timespan, timestamp, time_to_subtract):
-        """ Make sure the timespan includes the timestamp """
-
-        if timespan.start <= timestamp <= timespan.stop:
-            return timespan
-
-        timespan = TimeSpan(timespan.start - time_to_subtract, timespan.stop - time_to_subtract)
-
-        if timespan.stop < timestamp:
-            return self.check_timespan(timespan, timestamp, -time_to_subtract)
-
-        if timespan.start <= timestamp <= timespan.stop:
-            return timespan
-
-        return self.check_timespan(timespan, timestamp, time_to_subtract)
+    def _since_span(self, first_day, last_day):
+        """ Get a TimeSpan covering the days first_day to last_day, each ending at since_hour """
+        # Local datetimes rather than adding seconds, so daylight saving changes are handled
+        start = datetime.combine(first_day - timedelta(days=1), time(self.since_hour))
+        stop = datetime.combine(last_day, time(self.since_hour))
+        return TimeSpan(int(start.timestamp()), int(stop.timestamp()))
 
     def since(self, agg_dict, timestamp):
-        """ Get a TimeSpan for offset of since_hours from midnight """
+        """ Get a TimeSpan for days that start at since_hour instead of midnight """
 
-        time_to_subtract = 86400
-        if to_bool(agg_dict.get("last_month", False)):
-            time_to_subtract = 2419200
-        elif to_bool(agg_dict.get("last_year", False)):
-            time_to_subtract = 31536000
-
-        if to_bool(agg_dict.get("day", False)):
-            timespan = self.day(timestamp)
-        elif to_bool(agg_dict.get("yesterday", False)):
-            timespan = self.yesterday(timestamp)
-        elif to_bool(agg_dict.get("week", False)):
-            timespan = self.week(timestamp)
-        elif to_bool(agg_dict.get("month", False)):
-            timespan = self.month(timestamp)
-        elif to_bool(agg_dict.get("last_month", False)):
-            timespan = self.last_month(timestamp)
-        elif to_bool(agg_dict.get("year", False)):
-            timespan = self.year(timestamp)
-        elif to_bool(agg_dict.get("last_year", False)):
-            timespan = self.last_year(timestamp)
-        elif to_bool(agg_dict.get("alltime", False)):
+        if to_bool(agg_dict.get("alltime", False)):
             return self.alltime(timestamp)
-        else:
-            timespan = self.day(timestamp)
 
-        self.logger.loginf(f"Before timespan: {timespan}")
+        if self.since_hour == 0:
+            for period in ("yesterday", "week", "month", "last_month", "year", "last_year"):
+                if to_bool(agg_dict.get(period, False)):
+                    return self.period_timespans[period](timestamp)
+            return self.day(timestamp)
 
-        if self.since_seconds == 0:
-            return timespan
+        # Days are dated by the day they end on, and a month or year is the days dated within it.
+        # This matches BoM, eg October is 9am on 30 September to 9am on 31 October.
+        day = period_day(timestamp, self.since_hour)
 
-        if to_bool(agg_dict.get("yesterday", False)) or \
-            to_bool(agg_dict.get("last_month", False)) or \
-            to_bool(agg_dict.get("last_year", False)):
-            timestamp -= time_to_subtract
+        if to_bool(agg_dict.get("yesterday", False)):
+            return self._since_span(day - timedelta(days=1), day - timedelta(days=1))
 
-        timespan = self.shift_timespan(timespan)
+        if to_bool(agg_dict.get("week", False)):
+            first = day - timedelta(days=(day.weekday() - self.week_start) % 7)
+            return self._since_span(first, first + timedelta(days=6))
 
-        self.logger.loginf(f"After timespan: {timespan}")
+        if to_bool(agg_dict.get("month", False)):
+            first = day.replace(day=1)
+            next_month = (first + timedelta(days=32)).replace(day=1)
+            return self._since_span(first, next_month - timedelta(days=1))
 
-        return self.check_timespan(timespan, timestamp, time_to_subtract)
+        if to_bool(agg_dict.get("last_month", False)):
+            last = day.replace(day=1) - timedelta(days=1)
+            return self._since_span(last.replace(day=1), last)
+
+        if to_bool(agg_dict.get("year", False)):
+            return self._since_span(date(day.year, 1, 1), date(day.year, 12, 31))
+
+        if to_bool(agg_dict.get("last_year", False)):
+            return self._since_span(date(day.year - 1, 1, 1), date(day.year - 1, 12, 31))
+
+        return self._since_span(day, day)
 
 class AggregatedValuesService(StdService):
     """ A service to publish WeeWX loop and/or archive data to MQTT. """
@@ -553,25 +541,14 @@ class AggregatedValuesService(StdService):
 
         return new_record, failed
 
-    def should_reset(self, dt, eff_dt):
-
-        self.logger.loginf(f"dt: {dt.date()}")
-        self.logger.loginf(f"self.storage.dt: {self.storage.dt.date()}")
-
-        self.logger.loginf(f"eff_dt: {eff_dt.date()}")
-        self.logger.loginf(f"self.storage.eff_dt: {self.storage.eff_dt.date()}")
-
-        return dt.date() != self.storage.dt.date() or effective_date(dt, self.since_hour).date() != self.storage.eff_dt.date()
-
     def new_archive_record(self, event):
         record = event.record
 
-        dt = datetime.fromtimestamp(record["dateTime"])
-        self.logger.loginf(f"dt: {dt.date()}")
-        eff_dt = effective_date(dt, self.since_hour)
-        self.logger.loginf(f"eff_dt: {eff_dt.date()}")
-
-        should_reset = self.should_reset(dt, eff_dt)
+        # Cached values are recalculated when either kind of day changes, at midnight and at since_hour
+        day = period_day(record["dateTime"])
+        since_day = period_day(record["dateTime"], self.since_hour)
+        should_reset = (getattr(self.storage, "day", None), getattr(self.storage, "since_day", None)) != (day, since_day)
+        self.logger.logdbg(f"day: {day}, since_day: {since_day}, should_reset: {should_reset}")
 
         # Cached values are in the unit system of the record they were generated for
         unit_system = record["usUnits"]
@@ -601,13 +578,14 @@ class AggregatedValuesService(StdService):
 
             if should_reset or values is None:
                 values, failed = self.generate_records(record["dateTime"], unit_system, timeperiod)
-                self.storage.dt = dt
-                self.storage.eff_dt = eff_dt
 
                 # Don't cache partial results, so failed aggregations are retried on the next record
                 setattr(self.storage, timeperiod, None if failed else values)
 
             new_values.append(values)
+
+        self.storage.day = day
+        self.storage.since_day = since_day
 
         for records in new_values:
             for key in records.keys():

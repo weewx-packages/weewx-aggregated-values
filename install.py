@@ -18,7 +18,7 @@ import weewx
 
 from weecfg.extension import ExtensionInstaller
 
-VERSION = "1.1.9"
+VERSION = "1.1.10"
 
 def fatal_error(error_str):
     """ Print an error and abort the install. """
